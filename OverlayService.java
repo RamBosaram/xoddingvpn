@@ -1,5 +1,8 @@
 package com.creysvpn.app;
 
+import static android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE;
+
+import android.annotation.SuppressLint;
 import android.app.Notification;
 import android.app.NotificationChannel;
 import android.app.NotificationManager;
@@ -64,7 +67,7 @@ public class OverlayService extends Service {
 
     @Override
     public void onCreate() {
-        super.onCreate();
+       super.onCreate();
 
         vibrator = (Vibrator) getSystemService(VIBRATOR_SERVICE);
         windowManager = (WindowManager) getSystemService(WINDOW_SERVICE);
@@ -82,6 +85,7 @@ public class OverlayService extends Service {
         startIPChecking();
     }
 
+    @SuppressLint("ForegroundServiceType")
     private void showNotificationBar() {
         try {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
@@ -110,7 +114,7 @@ public class OverlayService extends Service {
                 builder = new Notification.Builder(this);
             }
 
-            Notification notif = builder
+            Notification notification = builder
                     .setContentTitle("CreysVPN")
                     .setContentText("Активен")
                     .setSmallIcon(android.R.drawable.ic_menu_info_details)
@@ -118,11 +122,17 @@ public class OverlayService extends Service {
                     .setOngoing(true)
                     .build();
 
-            startForeground(NOTIFICATION_ID, notif);
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+                startForeground(NOTIFICATION_ID, notification, FOREGROUND_SERVICE_TYPE_SPECIAL_USE);
+            } else {
+                startForeground(NOTIFICATION_ID, notification);
+            }
         } catch (Exception e) {
             e.printStackTrace();
         }
-    }private void createAllOverlays() {
+    }
+
+    private void createAllOverlays() {
         LayoutInflater inflater = LayoutInflater.from(this);
 
         // Уведомление
@@ -226,7 +236,7 @@ public class OverlayService extends Service {
     }
 
     private void handleGoClick() {
-        if (vibrator != null) vibrator.vibrate(50);
+//        if (vibrator != null) vibrator.vibrate(50);
 
         if (currentServerIP.isEmpty() || currentServerPort == 0) {
             showNotification("IP не найден!", false);
