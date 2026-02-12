@@ -1,5 +1,8 @@
 package com.creysvpn.app;
 
+import static android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE;
+
+import android.annotation.SuppressLint;
 import android.app.Notification;
 import android.app.NotificationChannel;
 import android.app.NotificationManager;
@@ -51,6 +54,7 @@ public class PcapVpnService extends VpnService {
         return START_STICKY;
     }
 
+    @SuppressLint("ForegroundServiceType")
     private void createNotification() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             NotificationChannel channel = new NotificationChannel(
@@ -74,7 +78,11 @@ public class PcapVpnService extends VpnService {
                 .setSmallIcon(android.R.drawable.ic_menu_info_details)
                 .build();
 
-        startForeground(1, notification);
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+            startForeground(1, notification, FOREGROUND_SERVICE_TYPE_SPECIAL_USE);
+        } else {
+            startForeground(1, notification);
+        }
     }
 
     private void startVPN() {
@@ -124,7 +132,8 @@ public class PcapVpnService extends VpnService {
     }
 
     @Override
-    public void onDestroy() {isRunning = false;
+    public void onDestroy() {
+        isRunning = false;
         stopNativePcap();
 
         if (nativeThread != null) {
