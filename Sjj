@@ -1,0 +1,248 @@
+package com.creysvpn.app;
+
+import android.content.Intent;
+import android.content.SharedPreferences;
+import android.net.VpnService;
+import android.os.Bundle;
+import android.os.Handler;
+import android.os.Looper;
+import android.widget.Button;
+import com.creysvpn.app.AppStatusManager;
+import android.widget.TextView;
+import androidx.appcompat.app.AppCompatActivity;
+
+public class VpnActivity extends AppCompatActivity {
+
+    private static final String PREFS = "creysvpn_prefs";
+    public static final String KEY_REPORT_TIME = "report_time";
+
+    // Используем тот же ключ что и KeyActivity — чтобы не сбивался таймер
+    private static final String KEY_EXPIRES = "key_expires";
+
+    private Button btnVpn;
+    private TextView tvStatus;
+    private Button btn7s, btn30s, btn180s;
+    private TextView tvSubscription;
+
+    private boolean vpnRunning = false;
+
+    private final Handler handler = new Handler(Looper.getMainLooper());
+    private final Runnable subscriptionTicker = new Runnable() {
+        @Override
+        public void run() {
+            updateSubscriptionTimer();
+            handler.postDelayed(this, 1000);
+        }
+    };
+
+    // Проверяет блокировку/тех.работы/истёкшую подписку каждые 30 секунд
+    // Работает пока приложение открыто — не нужно сворачивать
+    private final Runnable backgroundChecker = new Runnable() {
+        @Override
+        public void run() {
+            checkStatusAndSubscription();
+            handler.postDelayed(this, 30_000);
+        }
+    };
+
+    private void checkStatusAndSubscription() {
+        // Сначала онлайн статус — он может изменить expires_at через разморозку
+        AppStatusManager.check(VpnActivity.this, status -> {
+
+            // 1. Тех. работы — показываем баннер поверх
+            if (status.maintenance) {
+                Intent i = new Intent(VpnActivity.this, BlockActivity.class)
+                    .putExtra(BlockActivity.EXTRA_MODE, BlockActivity.MODE_MAINTENANCE)
+                    .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_SINGLE_TOP);
+                startActivity(i);
+                return;
+            }
+
+            // 2. Обновление — показываем баннер
+            if (status.update) {
+                Intent i = new Intent(VpnActivity.this, BlockActivity.class)
+                    .putExtra(BlockActivity.EXTRA_MODE, BlockActivity.MODE_UPDATE)
+                    .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_SINGLE_TOP);
+                startActivity(i);
+                return;
+            }
+
+            // 3. Проверяем подписку (после возможной разморозки expires_at мог обновиться)
+            SharedPreferences prefs = getSharedPreferences("creysvpn_prefs", MODE_PRIVATE);
+            long expires = prefs.getLong("key_expires", 0);
+            if (expires != Long.MAX_VALUE && expires > 0 && expires < System.currentTimeMillis()) {
+                prefs.edit()
+                    .remove("key_activated")
+                    .remove("key_expires")
+                    .remove("key_value")
+                    .apply();
+                startActivity(new Intent(VpnActivity.this, KeyActivity.class)
+                    .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TASK));
+                finish();
+            }
+        });
+    }
+
+    @Override
+    protected void onCreate(Bundle savedInstanceState) {
+        super.onCreate(savedInstanceState);
+        setContentView(R.layout.activity_vpn);
+
+        btnVpn       = findViewById(R.id.btnVpn);
+        tvStatus     = findViewById(R.id.tvStatus);
+        btn7s        = findViewById(R.id.btn_7s);
+        btn30s       = findViewById(R.id.btn_30s);
+        btn180s      = findViewById(R.id.btn_180s);
+        tvSubscription = findViewById(R.id.tvSubscription);
+
+        SharedPreferences prefs = getSharedPreferences(PREFS, MODE_PRIVATE);
+
+        // Восстанавливаем выбранное время
+        int savedTime = prefs.getInt(KEY_REPORT_TIME, 7);
+        applyTimeSelection(savedTime);
+
+        btn7s.setOnClickListener(v   -> applyTimeSelection(7));
+        btn30s.setOnClickListener(v  -> applyTimeSelection(30));
+        btn180s.setOnClickListener(v -> applyTimeSelection(180));
+
+        btnVpn.setOnClickListener(v -> {
+            if (!vpnRunning) startVpn();
+            else stopVpn();
+        });
+
+        vpnRunning = prefs.getBoolean("vpn_active", false);
+        updateVpnButton();
+
+        // Запускаем анимацию переливающегося фона
+        android.view.View rootLayout = findViewById(android.R.id.content);
+        try {
+            android.graphics.drawable.AnimationDrawable bgAnim =
+                    (android.graphics.drawable.AnimationDrawable) 
+                    getResources().getDrawable(R.drawable.gradient_background_animated, null);
+            rootLayout.setBackground(bgAnim);
+            bgAnim.setEnterFadeDuration(2000);
+            bgAnim.setExitFadeDuration(2000);
+            bgAnim.start();
+        } catch (Exception ignored) {}
+    }
+
+    @Override
+    protected void onResume() {
+        super.onResume();
+        handler.post(subscriptionTicker);
+        handler.post(backgroundChecker); // сразу проверяем при открытии
+        // Запускаем пульсацию кнопки
+        if (!vpnRunning) {
+            android.view.animation.Animation pulse = android.view.animation.AnimationUtils
+                    .loadAnimation(this, R.anim.anim_pulse);
+            btnVpn.startAnimation(pulse);
+        }
+    }
+
+    @Override
+    protected void onPause() {
+        super.onPause();
+        handler.removeCallbacks(subscriptionTicker);
+        handler.removeCallbacks(backgroundChecker);
+        btnVpn.clearAnimation();
+    }
+
+    private void updateSubscriptionTimer() {
+        if (tvSubscription == null) return;
+
+        // Читаем expires из тех же SharedPreferences что и KeyActivity
+        long expires = getSharedPreferences(PREFS, MODE_PRIVATE)
+                .getLong(KEY_EXPIRES, 0);
+
+        if (expires == 0) {
+            tvSubscription.setText("");
+            return;
+        }
+
+        if (expires == Long.MAX_VALUE) {
+            tvSubscription.setText("Подписка: навсегда ∞");
+            tvSubscription.setTextColor(0xFF888888); // всегда серый
+            return;
+        }
+
+        long remaining = expires - System.currentTimeMillis();
+
+        if (remaining <= 0) {
+            tvSubscription.setText("Подписка истекла");
+            tvSubscription.setTextColor(0xFFE94057);
+            return;
+        }
+
+        long days    = remaining / (24 * 60 * 60 * 1000L);
+        long hours   = (remaining % (24 * 60 * 60 * 1000L)) / (60 * 60 * 1000L);
+        long minutes = (remaining % (60 * 60 * 1000L)) / (60 * 1000L);
+        long seconds = (remaining % (60 * 1000L)) / 1000L;
+
+        String timeText;
+        if (days > 0) {
+            timeText = String.format("Подписка: %dд %02dч %02dм", days, hours, minutes);
+        } else if (hours > 0) {
+            timeText = String.format("Подписка: %dч %02dм %02dс", hours, minutes, seconds);
+        } else {
+            timeText = String.format("Подписка: %dм %02dс", minutes, seconds);
+        }
+
+        tvSubscription.setText(timeText);
+        // Таймер всегда серый — без смены цвета
+        tvSubscription.setTextColor(0xFF888888);
+    }
+
+    private void applyTimeSelection(int time) {
+        getSharedPreferences(PREFS, MODE_PRIVATE).edit().putInt(KEY_REPORT_TIME, time).apply();
+
+        int red   = 0xFFE94057;
+        int white = 0xFFFFFFFF;
+
+        btn7s.setTextColor(time == 7     ? red : white);
+        btn30s.setTextColor(time == 30   ? red : white);
+        btn180s.setTextColor(time == 180 ? red : white);
+    }
+
+    private void startVpn() {
+        Intent intent = VpnService.prepare(this);
+        if (intent != null) {
+            startActivityForResult(intent, 1);
+        } else {
+            onActivityResult(1, RESULT_OK, null);
+        }
+    }
+
+    @Override
+    protected void onActivityResult(int requestCode, int resultCode, Intent data) {
+        super.onActivityResult(requestCode, resultCode, data);
+        if (requestCode == 1 && resultCode == RESULT_OK) {
+            startService(new Intent(this, PcapVpnService.class));
+            startService(new Intent(this, OverlayService.class));
+            getSharedPreferences(PREFS, MODE_PRIVATE).edit().putBoolean("vpn_active", true).apply();
+            vpnRunning = true;
+            updateVpnButton();
+        }
+    }
+
+    private void stopVpn() {
+        Intent stop = new Intent(this, PcapVpnService.class);
+        stop.setAction("STOP");
+        startService(stop);
+        stopService(new Intent(this, OverlayService.class));
+        getSharedPreferences(PREFS, MODE_PRIVATE).edit().putBoolean("vpn_active", false).apply();
+        vpnRunning = false;
+        updateVpnButton();
+    }
+
+    private void updateVpnButton() {
+        if (vpnRunning) {
+            btnVpn.setBackground(getResources().getDrawable(R.drawable.button_vpn_on, null));
+            tvStatus.setText("ПОДКЛЮЧЕНО");
+            tvStatus.setTextColor(0xFF00C853);
+        } else {
+            btnVpn.setBackground(getResources().getDrawable(R.drawable.button_vpn_off, null));
+            tvStatus.setText("ОТКЛЮЧЕНО");
+            tvStatus.setTextColor(0xFF888888);
+        }
+    }
+}
